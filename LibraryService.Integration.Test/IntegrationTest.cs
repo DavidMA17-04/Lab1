@@ -1,163 +1,191 @@
-﻿
-using System.Collections.Generic;
-using System.Linq;
-using System.Net.Http;
+﻿using System.Net;
 using System.Text;
-using System.Threading.Tasks;
 using FluentAssertions;
-using LibraryService.WebAPI;
-using LibraryService.WebAPI.Data;
-using LibraryService.WebAPI.DTO;
+using LibraryService.Api;
+using LibraryService.DataAccess.Data;
+using LibraryService.Entities.DTO;
+using LibraryService.Entities.Models;
 using Microsoft.AspNetCore.Hosting;
-using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc.Testing;
-using Microsoft.AspNetCore.TestHost;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Newtonsoft.Json;
 using Xunit;
 
-namespace LibraryService.Tests
-{    
-    public class IntegrationTests : IClassFixture<WebApplicationFactory<Program>>
+namespace LibraryService.Tests;
+
+public class IntegrationTests : IClassFixture<WebApplicationFactory<Program>>
+{
+    private readonly WebApplicationFactory<Program> _factory;
+    private readonly LibraryContext _context;
+
+    public HttpClient Client { get; private set; }
+
+    public IntegrationTests(WebApplicationFactory<Program> factory)
     {
-        private readonly WebApplicationFactory<Program> _factory;
-        private readonly LibraryContext context;
+        _factory = factory;
+        _context = new LibraryContext(new DbContextOptionsBuilder<LibraryContext>()
+            .UseSqlite("DataSource=:memory:")
+            .EnableSensitiveDataLogging()
+            .Options);
 
-        public HttpClient Client { get; private set; }
-
-        public IntegrationTests(WebApplicationFactory<Program> factory)
+        Client = _factory.WithWebHostBuilder(builder =>
         {
-            _factory = factory;
-            context = new LibraryContext(new DbContextOptionsBuilder<LibraryContext>()
-                        .UseSqlite("DataSource=:memory:")
-                        .EnableSensitiveDataLogging()
-                        .Options);
-            Client = _factory.WithWebHostBuilder(builder =>
-                builder.UseStartup<Startup>()
-                .ConfigureServices(services =>
+            builder.ConfigureServices(services =>
+            {
+                var descriptors = services.Where(d =>
+                    d.ServiceType == typeof(LibraryContext) ||
+                    d.ServiceType == typeof(DbContextOptions<LibraryContext>) ||
+                    (d.ServiceType.IsGenericType &&
+                     d.ServiceType.GetGenericArguments().FirstOrDefault() == typeof(LibraryContext))).ToList();
+
+                foreach (var descriptor in descriptors)
+                    services.Remove(descriptor);
+
+                services.AddSingleton(_context);
+
+                _context.Database.OpenConnection();
+                _context.Database.EnsureCreated();
+                _context.SaveChanges();
+
+                foreach (var entity in _context.ChangeTracker.Entries().ToList())
                 {
-                    services.RemoveAll(typeof(LibraryContext));
-                    services.AddSingleton(context);
+                    entity.State = EntityState.Detached;
+                }
+            });
+        }).CreateClient();
+    }
 
-                    context.Database.OpenConnection();
-                    context.Database.EnsureCreated();
-
-                    context.SaveChanges();
-
-                    // Clear local context cache
-                    foreach (var entity in context.ChangeTracker.Entries().ToList())
-                    {
-                        entity.State = EntityState.Detached;
-                    }
-                })
-            ).CreateClient();
-        }
-
-        private async Task SeedLibrary()
+    private async Task SeedLibrary()
+    {
+        var libraries = new List<Library>
         {
-            var libraries = new List<Library>
-            {
-                new Library { Name = "Library Name 1", Location = "Location 1" },
-                new Library { Name = "Library Name 2", Location = "Location 2" },
-                new Library { Name = "Library Name 3", Location = "Location 3" },
-                new Library { Name = "Library Name 4", Location = "Location 4" }
-            };
+            new Library { Name = "Library Name 1", Location = "Location 1" },
+            new Library { Name = "Library Name 2", Location = "Location 2" },
+            new Library { Name = "Library Name 3", Location = "Location 3" },
+            new Library { Name = "Library Name 4", Location = "Location 4" }
+        };
 
-            await context.Libraries.AddRangeAsync(libraries);
-            await context.SaveChangesAsync();  // Save to the database
-        }
+        await _context.Libraries.AddRangeAsync(libraries);
+        await _context.SaveChangesAsync();
+    }
 
-        private async Task SeedBook(string bookName, int libraryId)
+    private async Task SeedBook(string bookName, int libraryId)
+    {
+        var bookForm = new BookForm
         {
-            var bookForm = new BookForm
-            {
-                Name = bookName
-            };
-            var response1 = await Client.PostAsync($"/api/libraries/{libraryId}/books",
-                new StringContent(JsonConvert.SerializeObject(bookForm), Encoding.UTF8, "application/json"));
-        }
+            Name = bookName,
+            Category = "General"
+        };
+        await Client.PostAsync($"/api/libraries/{libraryId}/books",
+            new StringContent(JsonConvert.SerializeObject(bookForm), Encoding.UTF8, "application/json"));
+    }
 
-        // TEST NAME - addBookToLibrary
-        // TEST DESCRIPTION - It adds book to a library
-        [Fact]
-        public async Task TestAddBook_Ok_GetBook_NotFound()
+    [Fact]
+    public async Task TestAddBook_Ok_GetBook_NotFound()
+    {
+        await SeedLibrary();
+
+        var bookForm = new BookForm
         {
-            await SeedLibrary();
+            Name = "Test book 1",
+            Category = "Fiction"
+        };
 
-            var bookForm = new BookForm
-            {
-                Name = "Test book 1",
-            };
+        var response1 = await Client.PostAsync("/api/libraries/1/books",
+            new StringContent(JsonConvert.SerializeObject(bookForm), Encoding.UTF8, "application/json"));
 
-            var response1 = await Client.PostAsync($"/api/libraries/1/books",
-                new StringContent(JsonConvert.SerializeObject(bookForm), Encoding.UTF8, "application/json"));
+        response1.StatusCode.Should().Be(HttpStatusCode.Created);
 
-            response1.StatusCode.Should().BeEquivalentTo(StatusCodes.Status201Created);
-
-            bookForm = new BookForm
-            {
-                Name = "Test book 2",
-            };
-
-            var response2 = await Client.PostAsync($"/api/libraries/100/books",
-                new StringContent(JsonConvert.SerializeObject(bookForm), Encoding.UTF8, "application/json"));
-
-            response2.StatusCode.Should().BeEquivalentTo(StatusCodes.Status404NotFound);
-        }
-
-        // TEST NAME - getBooksInALibrary
-        // TEST DESCRIPTION - It finds all books in a library by ID
-        [Fact]
-        public async Task TestGetBooks_Ok_NotFound()
+        bookForm = new BookForm
         {
-            await SeedLibrary();
+            Name = "Test book 2",
+            Category = "Fiction"
+        };
 
-            await SeedBook("test book 1", 1);
-            await SeedBook("test book 2", 1);
+        var response2 = await Client.PostAsync("/api/libraries/100/books",
+            new StringContent(JsonConvert.SerializeObject(bookForm), Encoding.UTF8, "application/json"));
 
-            var response1 = await Client.GetAsync($"/api/libraries/2/books");
-            response1.StatusCode.Should().BeEquivalentTo(StatusCodes.Status200OK);
-            var books = JsonConvert.DeserializeObject<IEnumerable<Book>>(response1.Content.ReadAsStringAsync().Result).ToList();
-            books.Count.Should().Be(0);
+        response2.StatusCode.Should().Be(HttpStatusCode.NotFound);
+    }
 
-            var response2 = await Client.GetAsync($"/api/libraries/1/books");
-            response2.StatusCode.Should().BeEquivalentTo(StatusCodes.Status200OK);
-            var books2 = JsonConvert.DeserializeObject<IEnumerable<Book>>(response2.Content.ReadAsStringAsync().Result).ToList();
-            books2.Count.Should().Be(2);
+    [Fact]
+    public async Task TestGetBooks_Ok_NotFound()
+    {
+        await SeedLibrary();
 
-            var response3 = await Client.GetAsync($"/api/libraries/31232/books");
-            response3.StatusCode.Should().BeEquivalentTo(StatusCodes.Status404NotFound);
-        }
+        await SeedBook("test book 1", 1);
+        await SeedBook("test book 2", 1);
 
-        // TEST NAME - deleteLibraryById
-        // TEST DESCRIPTION - Check delete library web api end point
-        [Fact]
-        public async Task TestDeleteLibrary()
+        var response1 = await Client.GetAsync("/api/libraries/2/books");
+        response1.StatusCode.Should().Be(HttpStatusCode.OK);
+        var books = JsonConvert.DeserializeObject<IEnumerable<Book>>(await response1.Content.ReadAsStringAsync())!.ToList();
+        books.Count.Should().Be(0);
+
+        var response2 = await Client.GetAsync("/api/libraries/1/books");
+        response2.StatusCode.Should().Be(HttpStatusCode.OK);
+        var books2 = JsonConvert.DeserializeObject<IEnumerable<Book>>(await response2.Content.ReadAsStringAsync())!.ToList();
+        books2.Count.Should().Be(2);
+
+        var response3 = await Client.GetAsync("/api/libraries/31232/books");
+        response3.StatusCode.Should().Be(HttpStatusCode.NotFound);
+    }
+
+    [Fact]
+    public async Task TestDeleteLibrary()
+    {
+        await SeedLibrary();
+
+        var bookForm = new BookForm
         {
-            await SeedLibrary();
+            Name = "test book 1",
+            Category = "General"
+        };
 
-            var bookForm = new BookForm
-            {
-                Name = "test book 1",
-            };
+        var response0 = await Client.PostAsync("/api/libraries/1/books",
+            new StringContent(JsonConvert.SerializeObject(bookForm), Encoding.UTF8, "application/json"));
+        response0.StatusCode.Should().Be(HttpStatusCode.Created);
 
-            // add book to library
-            var response0 = await Client.PostAsync("/api/libraries/1/books",
-                new StringContent(JsonConvert.SerializeObject(bookForm), Encoding.UTF8, "application/json"));
-            response0.StatusCode.Should().BeEquivalentTo(StatusCodes.Status201Created);
+        var response1 = await Client.DeleteAsync("/api/libraries/1");
+        response1.StatusCode.Should().Be(HttpStatusCode.NoContent);
 
-            // delete library
-            var response1 = await Client.DeleteAsync("/api/libraries/1");
-            response1.StatusCode.Should().BeEquivalentTo(StatusCodes.Status204NoContent);
+        var response2 = await Client.GetAsync("/api/libraries/1/books");
+        response2.StatusCode.Should().Be(HttpStatusCode.NotFound);
 
-            // Verify that delete is successful
-            var response2 = await Client.GetAsync("/api/libraries/1/books");
-            response2.StatusCode.Should().BeEquivalentTo(StatusCodes.Status404NotFound);
+        var response3 = await Client.DeleteAsync("/api/libraries/1");
+        response3.StatusCode.Should().Be(HttpStatusCode.NotFound);
+    }
 
-            var response3 = await Client.DeleteAsync("/api/libraries/1");
-            response3.StatusCode.Should().BeEquivalentTo(StatusCodes.Status404NotFound);
-        }
+    [Fact]
+    public async Task TestUpdateAndDeleteBook()
+    {
+        await SeedLibrary();
+
+        var bookForm = new BookForm
+        {
+            Name = "Original",
+            Category = "A"
+        };
+
+        var createResponse = await Client.PostAsync("/api/libraries/1/books",
+            new StringContent(JsonConvert.SerializeObject(bookForm), Encoding.UTF8, "application/json"));
+        createResponse.StatusCode.Should().Be(HttpStatusCode.Created);
+        var created = JsonConvert.DeserializeObject<Book>(await createResponse.Content.ReadAsStringAsync())!;
+
+        var updateForm = new BookForm
+        {
+            Name = "Updated",
+            Category = "B"
+        };
+        var updateResponse = await Client.PutAsync($"/api/libraries/1/books/{created.Id}",
+            new StringContent(JsonConvert.SerializeObject(updateForm), Encoding.UTF8, "application/json"));
+        updateResponse.StatusCode.Should().Be(HttpStatusCode.NoContent);
+
+        var deleteResponse = await Client.DeleteAsync($"/api/libraries/1/books/{created.Id}");
+        deleteResponse.StatusCode.Should().Be(HttpStatusCode.NoContent);
+
+        var missingDelete = await Client.DeleteAsync("/api/libraries/999/books/1");
+        missingDelete.StatusCode.Should().Be(HttpStatusCode.NotFound);
     }
 }
